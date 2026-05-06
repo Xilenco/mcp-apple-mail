@@ -1845,7 +1845,20 @@ async function main() {
 // Only run server + warm caches when executed directly, not when imported for testing
 const isDirectRun = process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/^\//, ""));
 if (isDirectRun) {
-  warmCaches();
-  startBackfill();
-  main().catch(console.error);
+  // warmCaches() and startBackfill() run AFTER main() so the MCP server
+  // responds to `initialize` immediately. Cold boot was ~30s (osascript Mail
+  // discovery + sync indexing of unindexed emails) which blew past the SDK's
+  // 5s init wait window — server stuck in "pending" status, tools never
+  // registered. Tool handlers have null-safe fallbacks (internalUuid → null,
+  // accountNameCache → SWR), so calls during the warmup window degrade
+  // gracefully instead of crashing.
+  main()
+    .then(() => {
+      // Defer cache warm + index pass to next macrotask so the server
+      // event loop can handle `tools/list` and other early requests
+      // while these run. They're still synchronous on their own tick,
+      // but the SDK's connection wait window has already passed.
+      setTimeout(() => { warmCaches(); startBackfill(); }, 100);
+    })
+    .catch(console.error);
 }
