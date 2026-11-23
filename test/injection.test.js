@@ -1,17 +1,48 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { appleScriptString, sqlInt, sqlString } from "../index.js";
+import { dirname, join, resolve } from "node:path";
+import {
+  appleScriptString,
+  generateAttachmentSnippet,
+  mimePartId,
+  mboxPathFromUrl,
+  sqlInt,
+  sqlString,
+  uniquePath,
+} from "../index.js";
+
+function assertAppleScriptRoundTrip(t, literal, value) {
+  try {
+    assert.equal(execFileSync("osascript", ["-e", `return ${literal}`], { encoding: "utf8" }), value + "\n");
+  } catch (error) {
+    if (error.code === "ENOENT") return t.skip("osascript is unavailable");
+    throw error;
+  }
+}
+
+function makeTempDir(t, prefix) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
 
 it("accepts safe integers and digit strings only", () => {
   for (const value of [5, "5", "005"]) assert.equal(sqlInt(value, "id"), 5);
-  assert.equal(sqlInt(-1, "limit"), -1); // SQLite accepts a negative LIMIT.
   for (const value of ["1; ATTACH 'x' AS y", "1 OR 1=1", 1.5, "../x", null, NaN,
-    "", " 5", "5\n", "-1", true, "9007199254740992", Infinity]) {
+    "", " 5", "5\n", -1, "-1", true, "9007199254740992", Infinity]) {
     assert.throws(() => sqlInt(value, "id"), /id must be a safe integer/);
+  }
+});
+
+it("accepts numeric MIME part ids and rejects path syntax", () => {
+  for (const [value, expected] of [[2, "2"], ["1.2", "1.2"], ["1.1.2", "1.1.2"]]) {
+    assert.equal(mimePartId(value), expected);
+  }
+  for (const value of ["../1", "1..2", "1.", ".1", "", "1/2", null]) {
+    assert.throws(() => mimePartId(value), /Invalid attachment_id\./);
   }
 });
 
@@ -25,12 +56,33 @@ it("round-trips an AppleScript string literal", t => {
   const value = 'a"b\\c';
   const literal = appleScriptString(value);
   assert.equal(literal, '"a\\"b\\\\c"');
-  try {
-    assert.equal(execFileSync("osascript", ["-e", `return ${literal}`], { encoding: "utf8" }), value + "\n");
-  } catch (error) {
-    if (error.code === "ENOENT") return t.skip("osascript is unavailable");
-    throw error;
-  }
+  assertAppleScriptRoundTrip(t, literal, value);
+});
+
+it("rejects NUL in AppleScript strings", () => {
+  assert.throws(() => appleScriptString("a\0b"), /NUL/);
+});
+
+it("rejects decoded mailbox path separators", () => {
+  const uuid = "A1B2C3D4-E5F6-7890-ABCD-EF1234567890";
+  assert.equal(mboxPathFromUrl(`imap://${uuid}/%2E%2E%2F%2E%2E%2Fetc`), null);
+  assert.equal(mboxPathFromUrl(`imap://${uuid}/INBOX%2F..`), null);
+});
+
+it("keeps generated attachment paths literal and inside the destination", t => {
+  const dir = makeTempDir(t, "mail-attachment-path-");
+  const filename = 'a"b\\c.txt';
+  const filePath = join(dir, filename);
+  writeFileSync(filePath, "attachment");
+  const snippet = generateAttachmentSnippet([filePath]);
+  const literal = appleScriptString(filePath);
+  assert.ok(snippet.includes(`POSIX file ${literal}`));
+  assertAppleScriptRoundTrip(t, literal, filePath);
+
+  const safePath = uniquePath(dir, 1, "../../evil.txt");
+  assert.equal(resolve(dirname(safePath)), resolve(dir));
+  assert.throws(() => uniquePath(dir, 1, ".."), /Invalid attachment filename\./);
+  assert.throws(() => uniquePath(dir, 1, "bad\0name.txt"), /Invalid attachment filename\./);
 });
 
 it("keeps shell execution out of index.js", () => {

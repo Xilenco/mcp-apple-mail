@@ -251,6 +251,7 @@ function findMessageLocation(emailId) {
 
 function escapeForAppleScript(str) {
   if (!str) return "";
+  if (str.includes("\0")) throw new Error("AppleScript strings cannot contain NUL.");
   return str
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
@@ -264,8 +265,14 @@ function appleScriptString(str) {
 
 function sqlInt(value, name) {
   const number = typeof value === "string" && /^[0-9]+$/.test(value) ? Number(value) : value;
-  if (!Number.isSafeInteger(number)) throw new Error(`${name} must be a safe integer.`);
+  if (!Number.isSafeInteger(number) || number < 0) throw new Error(`${name} must be a safe integer.`);
   return number;
+}
+
+function mimePartId(value) {
+  const partId = String(value ?? "");
+  if (!/^[0-9]+(?:\.[0-9]+)*$/.test(partId)) throw new Error("Invalid attachment_id.");
+  return partId;
 }
 
 function sqlString(value) {
@@ -1038,9 +1045,9 @@ function indexEmail(emailId, subject, sender, bodyText) {
   const id = sqlInt(emailId, "email_id");
   if (isIndexed(id)) return;
   // Truncate body to 50k chars to keep index size reasonable
-  const body = sqlString((bodyText || "").slice(0, 50000));
-  const subj = sqlString(subject || "");
-  const from = sqlString(sender || "");
+  const body = sqlString((bodyText || "").replace(/\0/g, "").slice(0, 50000));
+  const subj = sqlString((subject || "").replace(/\0/g, ""));
+  const from = sqlString((sender || "").replace(/\0/g, ""));
   try {
     runFts(`INSERT OR REPLACE INTO bodies (id, subject, sender, body) VALUES (${id}, ${subj}, ${from}, ${body})`);
     runFts(`INSERT OR REPLACE INTO indexed (id, ts) VALUES (${id}, ${sqlInt(Math.floor(Date.now() / 1000), "timestamp")})`);
@@ -1760,7 +1767,7 @@ function formatAttachmentList(attachments) {
 
 function uniquePath(dir, emailId, filename) {
   filename = basename(filename);
-  if (!filename || filename === "." || filename === "..") throw new Error("Invalid attachment filename.");
+  if (!filename || filename === "." || filename === ".." || filename.includes("\0")) throw new Error("Invalid attachment filename.");
   const ext = extname(filename);
   const base = basename(filename, ext);
   const prefix = `${sqlInt(emailId, "email_id")}_${base}`;
@@ -1802,7 +1809,7 @@ function handleDownloadAttachment(args) {
   const output = [];
   for (const att of toDownload) {
     // Attachment files live at {attDir}/{attachment_id}/{filename}
-    const srcDir = join(attDir, String(sqlInt(att.attachment_id, "attachment_id")));
+    const srcDir = join(attDir, mimePartId(att.attachment_id));
     if (!existsSync(srcDir)) {
       output.push(`Skipped: ${att.name} (not on disk)`);
       continue;
@@ -1832,6 +1839,7 @@ export {
   escapeForAppleScript,
   appleScriptString,
   sqlInt,
+  mimePartId,
   sqlString,
   handleSearchEmails,
   escapeForJxa,
@@ -1846,6 +1854,7 @@ export {
   loadSendConfig,
   validateAttachments,
   generateAttachmentSnippet,
+  uniquePath,
   revalidateAttachmentFile,
   getAttachmentAllowlist,
   isPathInAllowlist,
