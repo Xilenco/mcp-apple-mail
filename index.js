@@ -4,7 +4,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { execSync, exec } from "child_process";
+import { execFileSync, execFile } from "child_process";
 import { marked } from "marked";
 import { readFileSync, writeFileSync, unlinkSync, accessSync, readdirSync, existsSync, mkdirSync, statSync, lstatSync, copyFileSync, constants as fsConst } from "fs";
 import { join, basename, extname, resolve, normalize } from "path";
@@ -26,12 +26,12 @@ const server = new Server(
 
 function runJxa(script, { timeout = 30000 } = {}) {
   try {
-    const result = execSync(
-      `osascript -l JavaScript << 'JXA_EOF'\n${script}\nJXA_EOF`,
+    const result = execFileSync(
+      "osascript", ["-l", "JavaScript"],
       {
         encoding: "utf-8",
         maxBuffer: 10 * 1024 * 1024,
-        shell: "/bin/bash",
+        input: script + "\n",
         timeout,
       }
     );
@@ -133,12 +133,12 @@ function markdownToHtml(text) {
 
 function runAppleScript(script, { timeout = 30000 } = {}) {
   try {
-    const result = execSync(
-      `osascript << 'APPLESCRIPT_EOF'\n${script}\nAPPLESCRIPT_EOF`,
+    const result = execFileSync(
+      "osascript", [],
       {
         encoding: "utf-8",
         maxBuffer: 10 * 1024 * 1024,
-        shell: "/bin/bash",
+        input: script + "\n",
         timeout,
       }
     );
@@ -161,9 +161,9 @@ const VIRTUAL_MAILBOXES = new Set([
 ]);
 
 function findMessageLocation(emailId) {
+  const id = sqlInt(emailId, "email_id");
   // Try SQLite first (~1ms vs ~2.8s for JXA scan)
   try {
-    const id = Number(emailId);
     // Check labels table first (Gmail virtual folders like INBOX)
     const labelRows = parseSqlite(`
       SELECT mb.url FROM labels l
@@ -198,7 +198,7 @@ function findMessageLocation(emailId) {
   // JXA fallback if SQLite fails
   return parseJxa(`
     const mail = Application("Mail");
-    const msgId = ${Number(emailId)};
+    const msgId = ${id};
     const virtual = new Set(${JSON.stringify([...VIRTUAL_MAILBOXES])});
 
     function searchBoxes(boxes, path) {
@@ -256,6 +256,21 @@ function escapeForAppleScript(str) {
     .replace(/"/g, '\\"')
     .replace(/\n/g, "\\n")
     .replace(/\r/g, "\\r");
+}
+
+function appleScriptString(str) {
+  return `"${escapeForAppleScript(str)}"`;
+}
+
+function sqlInt(value, name) {
+  const number = typeof value === "string" && /^[0-9]+$/.test(value) ? Number(value) : value;
+  if (!Number.isSafeInteger(number)) throw new Error(`${name} must be a safe integer.`);
+  return number;
+}
+
+function sqlString(value) {
+  if (value.includes("\0")) throw new Error("SQL strings cannot contain NUL.");
+  return `'${value.replace(/'/g, "''")}'`;
 }
 
 function escapeForJxa(str) {
@@ -603,7 +618,7 @@ function handleListMailboxes(args) {
 
 // --- search_emails (SQLite direct read) ---
 
-const ENVELOPE_DB = `${process.env.HOME}/Library/Mail/V10/MailData/Envelope Index`;
+const ENVELOPE_DB = process.env.APPLE_MAIL_ENVELOPE_DB || `${process.env.HOME}/Library/Mail/V10/MailData/Envelope Index`;
 const MAIL_V10_DIR = `${process.env.HOME}/Library/Mail/V10`;
 
 // --- .emlx direct file read ---
@@ -637,12 +652,14 @@ function accountUuidFromUrl(url) {
 function mboxPathFromUrl(url) {
   const m = url.match(/^[a-z]+:\/\/[A-F0-9-]+\/(.+)$/i);
   if (!m) return null;
-  return m[1].split("/").map(s => decodeURIComponent(s) + ".mbox");
+  const segments = m[1].split("/").map(s => decodeURIComponent(s));
+  if (segments.some(s => s.includes("/") || s.includes("\0"))) return null;
+  return segments.map(s => s + ".mbox");
 }
 
 function findEmlxPath(emailId) {
+  const id = sqlInt(emailId, "email_id");
   if (!internalUuid) return null;
-  const id = Number(emailId);
 
   // Get the mailbox URL where the file physically lives
   // For Gmail, that's All Mail (messages.mailbox), not the label mailbox
@@ -871,23 +888,21 @@ function fetchAccountNames() {
 
 function refreshAccountNamesAsync() {
   // Fire-and-forget background refresh
-  import("child_process").then(({ exec }) => {
-    exec(
-      `osascript -l JavaScript -e 'var m=Application("Mail");var a=m.accounts();var r=[];for(var i=0;i<a.length;i++)r.push(JSON.stringify({id:a[i].id(),name:a[i].name()}));r.join("\\n")'`,
-      { timeout: 10000 },
-      (err, stdout) => {
-        if (err || !stdout) return;
-        const fresh = {};
-        for (const line of stdout.trim().split("\n")) {
-          try {
-            const o = JSON.parse(line);
-            fresh[o.id] = o.name;
-          } catch {}
-        }
-        if (Object.keys(fresh).length > 0) accountNameCache = fresh;
+  execFile(
+    "osascript", ["-l", "JavaScript", "-e", `var m=Application("Mail");var a=m.accounts();var r=[];for(var i=0;i<a.length;i++)r.push(JSON.stringify({id:a[i].id(),name:a[i].name()}));r.join("\\n")`],
+    { timeout: 10000 },
+    (err, stdout) => {
+      if (err || !stdout) return;
+      const fresh = {};
+      for (const line of stdout.trim().split("\n")) {
+        try {
+          const o = JSON.parse(line);
+          fresh[o.id] = o.name;
+        } catch {}
       }
-    );
-  });
+      if (Object.keys(fresh).length > 0) accountNameCache = fresh;
+    }
+  );
 }
 
 let lastRefresh = 0;
@@ -942,9 +957,9 @@ function jxaMailboxExpr(acctVar, pathSegments) {
 // Generate AppleScript expression to resolve a (possibly nested) mailbox
 // e.g. ["[Gmail]", "All Mail"] -> mailbox "All Mail" of mailbox "[Gmail]" of account "acctName"
 function asMailboxExpr(acctName, pathSegments) {
-  let expr = `account "${escapeForAppleScript(acctName)}"`;
+  let expr = `account ${appleScriptString(acctName)}`;
   for (const seg of pathSegments) {
-    expr = `mailbox "${escapeForAppleScript(seg)}" of ${expr}`;
+    expr = `mailbox ${appleScriptString(seg)} of ${expr}`;
   }
   return expr;
 }
@@ -952,8 +967,8 @@ function asMailboxExpr(acctName, pathSegments) {
 function runSqlite(query) {
   const q = query.replace(/\s+/g, " ").trim();
   try {
-    return execSync(
-      `sqlite3 -json ${JSON.stringify(ENVELOPE_DB)} ${JSON.stringify(q)}`,
+    return execFileSync(
+      "sqlite3", ["-json", ENVELOPE_DB, q],
       { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 10000 }
     ).trim();
   } catch (error) {
@@ -991,8 +1006,8 @@ function ensureFtsDb() {
 function runFts(query) {
   const q = query.replace(/\s+/g, " ").trim();
   try {
-    return execSync(
-      `sqlite3 ${JSON.stringify(FTS_DB)} ${JSON.stringify(q)}`,
+    return execFileSync(
+      "sqlite3", [FTS_DB, q],
       { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 10000 }
     ).trim();
   } catch (error) {
@@ -1003,8 +1018,8 @@ function runFts(query) {
 function parseFts(query) {
   const q = query.replace(/\s+/g, " ").trim();
   try {
-    const raw = execSync(
-      `sqlite3 -json ${JSON.stringify(FTS_DB)} ${JSON.stringify(q)}`,
+    const raw = execFileSync(
+      "sqlite3", ["-json", FTS_DB, q],
       { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024, timeout: 10000 }
     ).trim();
     if (!raw) return [];
@@ -1015,20 +1030,20 @@ function parseFts(query) {
 }
 
 function isIndexed(emailId) {
-  const rows = parseFts(`SELECT 1 FROM indexed WHERE id = ${Number(emailId)} LIMIT 1`);
+  const rows = parseFts(`SELECT 1 FROM indexed WHERE id = ${sqlInt(emailId, "email_id")} LIMIT 1`);
   return rows.length > 0;
 }
 
 function indexEmail(emailId, subject, sender, bodyText) {
-  const id = Number(emailId);
+  const id = sqlInt(emailId, "email_id");
   if (isIndexed(id)) return;
   // Truncate body to 50k chars to keep index size reasonable
-  const body = (bodyText || "").slice(0, 50000).replace(/'/g, "''");
-  const subj = (subject || "").replace(/'/g, "''");
-  const from = (sender || "").replace(/'/g, "''");
+  const body = sqlString((bodyText || "").slice(0, 50000));
+  const subj = sqlString(subject || "");
+  const from = sqlString(sender || "");
   try {
-    runFts(`INSERT OR REPLACE INTO bodies (id, subject, sender, body) VALUES (${id}, '${subj}', '${from}', '${body}')`);
-    runFts(`INSERT OR REPLACE INTO indexed (id, ts) VALUES (${id}, ${Math.floor(Date.now() / 1000)})`);
+    runFts(`INSERT OR REPLACE INTO bodies (id, subject, sender, body) VALUES (${id}, ${subj}, ${from}, ${body})`);
+    runFts(`INSERT OR REPLACE INTO indexed (id, ts) VALUES (${id}, ${sqlInt(Math.floor(Date.now() / 1000), "timestamp")})`);
   } catch {}
 }
 
@@ -1094,12 +1109,12 @@ function handleSearchEmails(args) {
   const query = args?.query || null;
   const mailboxName = args?.mailbox || "INBOX";
   const accountName = args?.account || null;
-  const limit = args?.limit || 10;
+  const limit = sqlInt(args?.limit === 0 ? 10 : args?.limit ?? 10, "limit");
   const sortDir = args?.sort === "asc" ? "ASC" : "DESC";
 
   // Resolve mailbox filter: match by last URL segment (URL-encoded in the DB)
-  const encodedMbox = encodeURIComponent(mailboxName).replace(/'/g, "''");
-  const escapedQuery = query ? query.replace(/'/g, "''") : "";
+  const mailboxPattern = sqlString(`%/${encodeURIComponent(mailboxName)}`);
+  const queryPattern = query ? sqlString(`%${query}%`) : "";
 
   // Account filter: resolve name to UUID if provided
   let accountUuidFilter = null;
@@ -1111,17 +1126,17 @@ function handleSearchEmails(args) {
   }
 
   const accountClauseLabel = accountUuidFilter
-    ? `AND mb_label.url LIKE '%${accountUuidFilter}%'`
+    ? `AND mb_label.url LIKE ${sqlString(`%${accountUuidFilter}%`)}`
     : "";
   const accountClauseDirect = accountUuidFilter
-    ? `AND mb.url LIKE '%${accountUuidFilter}%'`
+    ? `AND mb.url LIKE ${sqlString(`%${accountUuidFilter}%`)}`
     : "";
 
   // Messages live in the "source" mailbox (e.g. All Mail for Gmail).
   // The labels table maps them to virtual mailboxes (INBOX, Sent, etc.).
   // For source mailboxes (Spam, Trash, Drafts) messages are stored directly.
   const searchClause = query
-    ? `AND (s.subject LIKE '%${escapedQuery}%' OR a.address LIKE '%${escapedQuery}%' OR a.comment LIKE '%${escapedQuery}%')`
+    ? `AND (s.subject LIKE ${queryPattern} OR a.address LIKE ${queryPattern} OR a.comment LIKE ${queryPattern})`
     : "";
   const unreadClause = args?.unread_only ? "AND m.read = 0" : "";
 
@@ -1129,11 +1144,11 @@ function handleSearchEmails(args) {
   let dateClause = "";
   if (args?.after) {
     const ts = Math.floor(new Date(args.after).getTime() / 1000);
-    if (!isNaN(ts)) dateClause += ` AND m.date_received >= ${ts}`;
+    if (!isNaN(ts)) dateClause += ` AND m.date_received >= ${sqlInt(ts, "after")}`;
   }
   if (args?.before) {
     const ts = Math.floor(new Date(args.before + "T23:59:59").getTime() / 1000);
-    if (!isNaN(ts)) dateClause += ` AND m.date_received <= ${ts}`;
+    if (!isNaN(ts)) dateClause += ` AND m.date_received <= ${sqlInt(ts, "before")}`;
   }
 
   const sql = `
@@ -1144,7 +1159,7 @@ function handleSearchEmails(args) {
     JOIN mailboxes mb_label ON mb_label.ROWID = l.mailbox_id
     JOIN subjects s ON s.ROWID = m.subject
     JOIN addresses a ON a.ROWID = m.sender
-    WHERE mb_label.url LIKE '%/${encodedMbox}'
+    WHERE mb_label.url LIKE ${mailboxPattern}
       ${accountClauseLabel}
       ${searchClause}
       ${unreadClause}
@@ -1169,7 +1184,7 @@ function handleSearchEmails(args) {
       JOIN mailboxes mb ON mb.ROWID = m.mailbox
       JOIN subjects s ON s.ROWID = m.subject
       JOIN addresses a ON a.ROWID = m.sender
-      WHERE mb.url LIKE '%/${encodedMbox}'
+      WHERE mb.url LIKE ${mailboxPattern}
         ${accountClauseDirect}
         ${searchClause}
         ${unreadClause}
@@ -1185,7 +1200,7 @@ function handleSearchEmails(args) {
   }
 
   // Batch check which messages have attachments
-  const ids = data.map(e => e.id);
+  const ids = data.map(e => sqlInt(e.id, "email_id"));
   const attSet = new Set();
   if (ids.length) {
     try {
@@ -1221,7 +1236,7 @@ function handleGetEmail(args) {
     try {
       const data = parseEmlx(emlxPath);
       // Get read/flagged status from SQLite
-      const meta = parseSqlite(`SELECT read, flagged FROM messages WHERE ROWID = ${Number(emailId)}`);
+      const meta = parseSqlite(`SELECT read, flagged FROM messages WHERE ROWID = ${sqlInt(emailId, "email_id")}`);
       const isRead = meta.length > 0 ? !!meta[0].read : false;
       const isFlagged = meta.length > 0 ? !!meta[0].flagged : false;
 
@@ -1255,7 +1270,7 @@ function handleGetEmail(args) {
 
   const data = parseJxa(`
     const mail = Application("Mail");
-    const msgId = ${Number(emailId)};
+    const msgId = ${sqlInt(emailId, "email_id")};
     let found = null;
     try {
       const acct = mail.accounts.whose({name: ${escapeForJxa(loc.account)}})()[0];
@@ -1307,9 +1322,9 @@ function handleGetEmail(args) {
 function handleSearchBody(args) {
   const query = args?.query;
   if (!query) return err("query is required.");
-  const limit = args?.limit || 20;
+  const limit = sqlInt(args?.limit === 0 ? 20 : args?.limit ?? 20, "limit");
 
-  const escapedQuery = query.replace(/'/g, "''").replace(/"/g, '""');
+  const escapedQuery = query.replace(/"/g, '""');
 
   // FTS5 MATCH query with BM25 ranking
   const results = parseFts(`
@@ -1317,7 +1332,7 @@ function handleSearchBody(args) {
            rank
     FROM fts
     JOIN bodies b ON b.id = fts.rowid
-    WHERE fts MATCH '"${escapedQuery}"'
+    WHERE fts MATCH ${sqlString(`"${escapedQuery}"`)}
     ORDER BY rank
     LIMIT ${limit}
   `);
@@ -1329,7 +1344,7 @@ function handleSearchBody(args) {
              rank
       FROM fts
       JOIN bodies b ON b.id = fts.rowid
-      WHERE fts MATCH '${escapedQuery}'
+      WHERE fts MATCH ${sqlString(escapedQuery)}
       ORDER BY rank
       LIMIT ${limit}
     `);
@@ -1345,7 +1360,7 @@ function handleSearchBody(args) {
 function formatBodyResults(results, query) {
   const stats = ftsIndexStats();
   // Get dates from Envelope Index for these message IDs
-  const ids = results.map(r => r.id).join(",");
+  const ids = results.map(r => sqlInt(r.id, "email_id")).join(",");
   let dateMap = {};
   try {
     const dates = parseSqlite(`SELECT ROWID as id, date_received FROM messages WHERE ROWID IN (${ids})`);
@@ -1394,7 +1409,7 @@ function generateAttachmentSnippet(validatedPaths, msgVar = "newMsg") {
       // which is acceptable — we've done our due diligence.
       continue;
     }
-    snippet += `\n    tell content of ${msgVar}\n        make new attachment with properties {file name:POSIX file "${escapeForAppleScript(filePath)}"} at after the last paragraph\n    end tell`;
+    snippet += `\n    tell content of ${msgVar}\n        make new attachment with properties {file name:POSIX file ${appleScriptString(filePath)}} at after the last paragraph\n    end tell`;
   }
   return snippet;
 }
@@ -1404,13 +1419,13 @@ function generateAttachmentSnippet(validatedPaths, msgVar = "newMsg") {
 // Write HTML body to a temp RTF file, set it on the message, then delete the file.
 // Returns the AppleScript snippet to embed (reads from tmpPath).
 function setRtfBody(htmlBody, msgVar = "newMsg") {
-  const rtfPath = `/tmp/mcp-mail-body-${Date.now()}.rtf`;
-  const rtf = execSync(
-    `textutil -stdin -format html -inputencoding UTF-8 -convert rtf -stdout`,
+  const rtfPath = join(tmpdir(), `mcp-mail-body-${Date.now()}.rtf`);
+  const rtf = execFileSync(
+    "textutil", ["-stdin", "-format", "html", "-inputencoding", "UTF-8", "-convert", "rtf", "-stdout"],
     { input: Buffer.from(htmlBody, "utf8"), timeout: 10000 }
   );
   writeFileSync(rtfPath, rtf);
-  return { tmpPath: rtfPath, snippet: `set content of ${msgVar} to (read POSIX file "${rtfPath}" as «class RTF »)` };
+  return { tmpPath: rtfPath, snippet: `set content of ${msgVar} to (read POSIX file ${appleScriptString(rtfPath)} as «class RTF »)` };
 }
 
 function handleCompose(args) {
@@ -1449,14 +1464,14 @@ function handleCompose(args) {
         bodySnippet = `\n    ${rtf.snippet}`;
       }
       let script = `tell application "Mail"
-    set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", visible:true}`;
-      if (to) script += `\n    tell newMsg\n        make new to recipient at end of to recipients with properties {address:"${escapeForAppleScript(to)}"}\n    end tell`;
-      if (cc) script += `\n    tell newMsg\n        make new cc recipient at end of cc recipients with properties {address:"${escapeForAppleScript(cc)}"}\n    end tell`;
-      if (from) script += `\n    tell newMsg\n        set sender to "${escapeForAppleScript(from)}"\n    end tell`;
+    set newMsg to make new outgoing message with properties {subject:${appleScriptString(subject)}, visible:true}`;
+      if (to) script += `\n    tell newMsg\n        make new to recipient at end of to recipients with properties {address:${appleScriptString(to)}}\n    end tell`;
+      if (cc) script += `\n    tell newMsg\n        make new cc recipient at end of cc recipients with properties {address:${appleScriptString(cc)}}\n    end tell`;
+      if (from) script += `\n    tell newMsg\n        set sender to ${appleScriptString(from)}\n    end tell`;
       script += bodySnippet;
       const attachmentSnippet = generateAttachmentSnippet(validatedAttachments, "newMsg");
       script += attachmentSnippet;
-      if (signatureName) script += `\n    set message signature of newMsg to signature "${escapeForAppleScript(signatureName)}"`;
+      if (signatureName) script += `\n    set message signature of newMsg to signature ${appleScriptString(signatureName)}`;
       script += `\n    activate\nend tell`;
       runAppleScript(script);
     } finally {
@@ -1491,8 +1506,8 @@ function handleCompose(args) {
       const sourceExpr = asMailboxExpr(loc.account, loc.mailboxPath || [loc.mailbox]);
       let script = `tell application "Mail"
     set targetBox to ${sourceExpr}
-    set msgs to (every message of targetBox whose id is ${Number(emailId)})
-    if (count of msgs) is 0 then return "Error: Email ${emailId} not found."
+    set msgs to (every message of targetBox whose id is ${sqlInt(emailId, "email_id")})
+    if (count of msgs) is 0 then return ${appleScriptString(`Error: Email ${emailId} not found.`)}
     set msg to item 1 of msgs
     set replyMsg to (${action})${bodySnippet}`;
       const attachmentSnippet = generateAttachmentSnippet(validatedAttachments, "replyMsg");
@@ -1532,16 +1547,16 @@ function handleMoveEmail(args) {
 
   const script = `tell application "Mail"
     set targetBox to ${sourceExpr}
-    set msgs to (every message of targetBox whose id is ${Number(emailId)})
-    if (count of msgs) is 0 then return "Error: Email ${emailId} not found."
+    set msgs to (every message of targetBox whose id is ${sqlInt(emailId, "email_id")})
+    if (count of msgs) is 0 then return ${appleScriptString(`Error: Email ${emailId} not found.`)}
     set targetMsg to item 1 of msgs
     set destBox to missing value
     try
         set destBox to ${destExpr}
     end try
-    if destBox is missing value then return "Error: Mailbox '${escapeForAppleScript(destination)}' not found."
+    if destBox is missing value then return ${appleScriptString(`Error: Mailbox '${destination}' not found.`)}
     move targetMsg to destBox
-    return "Moved email ${emailId} to ${escapeForAppleScript(destination)}."
+    return ${appleScriptString(`Moved email ${emailId} to ${destination}.`)}
 end tell`;
 
   const result = runAppleScript(script);
@@ -1595,13 +1610,13 @@ function handleSendEmail(args) {
     tmpPath = rtf.tmpPath;
 
     const sigLine = config.signature_name
-      ? `\n        set message signature of newMsg to signature "${escapeForAppleScript(config.signature_name)}"`
+      ? `\n        set message signature of newMsg to signature ${appleScriptString(config.signature_name)}`
       : "";
     let script = `tell application "Mail"
-    set newMsg to make new outgoing message with properties {subject:"${escapeForAppleScript(subject)}", visible:false}
+    set newMsg to make new outgoing message with properties {subject:${appleScriptString(subject)}, visible:false}
     tell newMsg
-        make new to recipient at end of to recipients with properties {address:"${escapeForAppleScript(to)}"}
-        set sender to "${escapeForAppleScript(config.from_email)}"
+        make new to recipient at end of to recipients with properties {address:${appleScriptString(to)}}
+        set sender to ${appleScriptString(config.from_email)}
     end tell
     ${rtf.snippet}${sigLine}`;
     const attachmentSnippet = generateAttachmentSnippet(validatedAttachments, "newMsg");
@@ -1636,14 +1651,15 @@ function handleArchiveEmails(args) {
   const byMailbox = {};
   const notFound = [];
   for (const id of emailIds) {
-    const loc = findMessageLocation(Number(id));
+    const messageId = sqlInt(id, "email_id");
+    const loc = findMessageLocation(messageId);
     if (!loc) {
       notFound.push(id);
       continue;
     }
     const key = `${loc.account}|||${loc.mailbox}`;
     if (!byMailbox[key]) byMailbox[key] = { account: loc.account, mailbox: loc.mailbox, mailboxPath: loc.mailboxPath || [loc.mailbox], ids: [] };
-    byMailbox[key].ids.push(Number(id));
+    byMailbox[key].ids.push(messageId);
   }
 
   let archived = 0;
@@ -1706,13 +1722,13 @@ function handleArchiveEmails(args) {
 // --- attachments ---
 
 function getAttachmentInfo(emailId) {
-  const id = Number(emailId);
+  const id = sqlInt(emailId, "email_id");
   return parseSqlite(`SELECT attachment_id, name FROM attachments WHERE message = ${id}`);
 }
 
 function findAttachmentDir(emailId) {
+  const id = sqlInt(emailId, "email_id");
   if (!internalUuid) return null;
-  const id = Number(emailId);
   const rows = parseSqlite(`SELECT mb.url FROM messages m JOIN mailboxes mb ON mb.ROWID = m.mailbox WHERE m.ROWID = ${id}`);
   if (!rows.length) return null;
 
@@ -1743,9 +1759,11 @@ function formatAttachmentList(attachments) {
 }
 
 function uniquePath(dir, emailId, filename) {
+  filename = basename(filename);
+  if (!filename || filename === "." || filename === "..") throw new Error("Invalid attachment filename.");
   const ext = extname(filename);
   const base = basename(filename, ext);
-  const prefix = `${emailId}_${base}`;
+  const prefix = `${sqlInt(emailId, "email_id")}_${base}`;
   let candidate = join(dir, `${prefix}${ext}`);
   if (!existsSync(candidate)) return candidate;
   let n = 1;
@@ -1784,7 +1802,7 @@ function handleDownloadAttachment(args) {
   const output = [];
   for (const att of toDownload) {
     // Attachment files live at {attDir}/{attachment_id}/{filename}
-    const srcDir = join(attDir, att.attachment_id);
+    const srcDir = join(attDir, String(sqlInt(att.attachment_id, "attachment_id")));
     if (!existsSync(srcDir)) {
       output.push(`Skipped: ${att.name} (not on disk)`);
       continue;
@@ -1812,6 +1830,10 @@ export {
   cleanBody,
   markdownToHtml,
   escapeForAppleScript,
+  appleScriptString,
+  sqlInt,
+  sqlString,
+  handleSearchEmails,
   escapeForJxa,
   decodeMimeWords,
   decodeQuotedPrintable,

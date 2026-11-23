@@ -191,15 +191,15 @@ describe("validateAttachments", () => {
   });
 
   it("rejects path with single .. (traversal attempt)", () => {
-    const result = validateAttachments(["/tmp/foo/../bar/file.txt"]);
+    const result = validateAttachments([`${testDir}/foo/../bar/file.txt`]);
     assert.equal(typeof result, "string");
     assert.ok(result.includes("not canonical"));
   });
 
   it("rejects path with ... (three dots) if it normalizes differently", () => {
     // Three dots is not special in path resolution, but test the edge case
-    // A path like /tmp/.../file should only fail if the directory doesn't exist
-    const result = validateAttachments(["/tmp/.../nonexistent-file.txt"]);
+    // A path containing .../file should only fail if the directory doesn't exist
+    const result = validateAttachments([join(testDir, "...", "nonexistent-file.txt")]);
     assert.equal(typeof result, "string");
     // Could be "not found" or "not canonical" depending on normalization
     assert.ok(result.includes("not found") || result.includes("not canonical"));
@@ -217,7 +217,7 @@ describe("validateAttachments", () => {
     // Save and clear env
     const savedEnv = process.env.APPLE_MAIL_ATTACHMENT_DIRS;
     try {
-      process.env.APPLE_MAIL_ATTACHMENT_DIRS = "/tmp:/var/folders";
+      process.env.APPLE_MAIL_ATTACHMENT_DIRS = testDir;
       const result = validateAttachments(["/etc/passwd"]);
       assert.equal(typeof result, "string");
       assert.ok(result.includes("not in allowed directories"));
@@ -230,11 +230,11 @@ describe("validateAttachments", () => {
     }
   });
 
-  it("accepts path in /tmp when allowlist includes it", function(t) {
+  it("accepts path in the test directory when allowlist includes it", function(t) {
     const filePath = createTestFile("allowlist-test.txt", 512);
     const savedEnv = process.env.APPLE_MAIL_ATTACHMENT_DIRS;
     try {
-      process.env.APPLE_MAIL_ATTACHMENT_DIRS = "/tmp:/var/folders";
+      process.env.APPLE_MAIL_ATTACHMENT_DIRS = testDir;
       const result = validateAttachments([filePath]);
       assert.ok(Array.isArray(result));
       assert.equal(result.length, 1);
